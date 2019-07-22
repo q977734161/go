@@ -5,6 +5,7 @@
 package pe
 
 import (
+	"bytes"
 	"debug/dwarf"
 	"internal/testenv"
 	"io/ioutil"
@@ -12,8 +13,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"testing"
+	"text/template"
 )
 
 type fileTest struct {
@@ -288,28 +292,82 @@ func TestOpenFailure(t *testing.T) {
 	}
 }
 
-func TestDWARF(t *testing.T) {
+const (
+	linkNoCgo = iota
+	linkCgoDefault
+	linkCgoInternal
+	linkCgoExternal
+)
+
+func getImageBase(f *File) uintptr {
+	switch oh := f.OptionalHeader.(type) {
+	case *OptionalHeader32:
+		return uintptr(oh.ImageBase)
+	case *OptionalHeader64:
+		return uintptr(oh.ImageBase)
+	default:
+		panic("unexpected optionalheader type")
+	}
+}
+
+func testDWARF(t *testing.T, linktype int) {
 	if runtime.GOOS != "windows" {
 		t.Skip("skipping windows only test")
 	}
+	testenv.MustHaveGoRun(t)
 
 	tmpdir, err := ioutil.TempDir("", "TestDWARF")
 	if err != nil {
-		t.Fatal("TempDir failed: ", err)
+		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmpdir)
 
-	prog := `
-package main
-func main() {
-}
-`
 	src := filepath.Join(tmpdir, "a.go")
-	exe := filepath.Join(tmpdir, "a.exe")
-	err = ioutil.WriteFile(src, []byte(prog), 0644)
-	output, err := exec.Command(testenv.GoToolPath(t), "build", "-o", exe, src).CombinedOutput()
+	file, err := os.Create(src)
 	if err != nil {
-		t.Fatalf("building test executable failed: %s %s", err, output)
+		t.Fatal(err)
+	}
+	err = template.Must(template.New("main").Parse(testprog)).Execute(file, linktype != linkNoCgo)
+	if err != nil {
+		if err := file.Close(); err != nil {
+			t.Error(err)
+		}
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	exe := filepath.Join(tmpdir, "a.exe")
+	args := []string{"build", "-o", exe}
+	switch linktype {
+	case linkNoCgo:
+	case linkCgoDefault:
+	case linkCgoInternal:
+		args = append(args, "-ldflags", "-linkmode=internal")
+	case linkCgoExternal:
+		args = append(args, "-ldflags", "-linkmode=external")
+	default:
+		t.Fatalf("invalid linktype parameter of %v", linktype)
+	}
+	args = append(args, src)
+	out, err := exec.Command(testenv.GoToolPath(t), args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("building test executable for linktype %d failed: %s %s", linktype, err, out)
+	}
+	out, err = exec.Command(exe).CombinedOutput()
+	if err != nil {
+		t.Fatalf("running test executable failed: %s %s", err, out)
+	}
+	t.Logf("Testprog output:\n%s", string(out))
+
+	matches := regexp.MustCompile("offset=(.*)\n").FindStringSubmatch(string(out))
+	if len(matches) < 2 {
+		t.Fatalf("unexpected program output: %s", out)
+	}
+	wantoffset, err := strconv.ParseUint(matches[1], 0, 64)
+	if err != nil {
+		t.Fatalf("unexpected main offset %q: %s", matches[1], err)
 	}
 
 	f, err := Open(exe)
@@ -317,6 +375,18 @@ func main() {
 		t.Fatal(err)
 	}
 	defer f.Close()
+
+	imageBase := getImageBase(f)
+
+	var foundDebugGDBScriptsSection bool
+	for _, sect := range f.Sections {
+		if sect.Name == ".debug_gdb_scripts" {
+			foundDebugGDBScriptsSection = true
+		}
+	}
+	if !foundDebugGDBScriptsSection {
+		t.Error(".debug_gdb_scripts section is not found")
+	}
 
 	d, err := f.DWARF()
 	if err != nil {
@@ -334,10 +404,20 @@ func main() {
 			break
 		}
 		if e.Tag == dwarf.TagSubprogram {
-			for _, f := range e.Field {
-				if f.Attr == dwarf.AttrName && e.Val(dwarf.AttrName) == "main.main" {
-					return
+			name, ok := e.Val(dwarf.AttrName).(string)
+			if ok && name == "main.main" {
+				t.Logf("Found main.main")
+				addr, ok := e.Val(dwarf.AttrLowpc).(uint64)
+				if !ok {
+					t.Fatal("Failed to get AttrLowpc")
 				}
+				offset := uintptr(addr) - imageBase
+				if offset != uintptr(wantoffset) {
+					t.Fatal("Runtime offset (0x%x) did "+
+						"not match dwarf offset "+
+						"(0x%x)", wantoffset, offset)
+				}
+				return
 			}
 		}
 	}
@@ -413,5 +493,187 @@ main(void)
 		if b != 0 {
 			t.Fatalf(".bss section has non zero bytes: %v", data)
 		}
+	}
+}
+
+func TestDWARF(t *testing.T) {
+	testDWARF(t, linkNoCgo)
+}
+
+const testprog = `
+package main
+
+import "fmt"
+import "syscall"
+import "unsafe"
+{{if .}}import "C"
+{{end}}
+
+// struct MODULEINFO from the Windows SDK
+type moduleinfo struct {
+	BaseOfDll uintptr
+	SizeOfImage uint32
+	EntryPoint uintptr
+}
+
+func add(p unsafe.Pointer, x uintptr) unsafe.Pointer {
+	return unsafe.Pointer(uintptr(p) + x)
+}
+
+func funcPC(f interface{}) uintptr {
+	var a uintptr
+	return **(**uintptr)(add(unsafe.Pointer(&f), unsafe.Sizeof(a)))
+}
+
+func main() {
+	kernel32 := syscall.MustLoadDLL("kernel32.dll")
+	psapi := syscall.MustLoadDLL("psapi.dll")
+	getModuleHandle := kernel32.MustFindProc("GetModuleHandleW")
+	getCurrentProcess := kernel32.MustFindProc("GetCurrentProcess")
+	getModuleInformation := psapi.MustFindProc("GetModuleInformation")
+
+	procHandle, _, _ := getCurrentProcess.Call()
+	moduleHandle, _, err := getModuleHandle.Call(0)
+	if moduleHandle == 0 {
+		panic(fmt.Sprintf("GetModuleHandle() failed: %d", err))
+	}
+
+	var info moduleinfo
+	ret, _, err := getModuleInformation.Call(procHandle, moduleHandle,
+		uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+
+	if ret == 0 {
+		panic(fmt.Sprintf("GetModuleInformation() failed: %d", err))
+	}
+
+	offset := funcPC(main) - info.BaseOfDll
+	fmt.Printf("base=0x%x\n", info.BaseOfDll)
+	fmt.Printf("main=%p\n", main)
+	fmt.Printf("offset=0x%x\n", offset)
+}
+`
+
+func TestBuildingWindowsGUI(t *testing.T) {
+	testenv.MustHaveGoBuild(t)
+
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping windows only test")
+	}
+	tmpdir, err := ioutil.TempDir("", "TestBuildingWindowsGUI")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpdir)
+
+	src := filepath.Join(tmpdir, "a.go")
+	err = ioutil.WriteFile(src, []byte(`package main; func main() {}`), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exe := filepath.Join(tmpdir, "a.exe")
+	cmd := exec.Command(testenv.GoToolPath(t), "build", "-ldflags", "-H=windowsgui", "-o", exe, src)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("building test executable failed: %s %s", err, out)
+	}
+
+	f, err := Open(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	const _IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
+
+	switch oh := f.OptionalHeader.(type) {
+	case *OptionalHeader32:
+		if oh.Subsystem != _IMAGE_SUBSYSTEM_WINDOWS_GUI {
+			t.Errorf("unexpected Subsystem value: have %d, but want %d", oh.Subsystem, _IMAGE_SUBSYSTEM_WINDOWS_GUI)
+		}
+	case *OptionalHeader64:
+		if oh.Subsystem != _IMAGE_SUBSYSTEM_WINDOWS_GUI {
+			t.Errorf("unexpected Subsystem value: have %d, but want %d", oh.Subsystem, _IMAGE_SUBSYSTEM_WINDOWS_GUI)
+		}
+	default:
+		t.Fatalf("unexpected OptionalHeader type: have %T, but want *pe.OptionalHeader32 or *pe.OptionalHeader64", oh)
+	}
+}
+
+func TestImportTableInUnknownSection(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping Windows-only test")
+	}
+
+	// ws2_32.dll import table is located in ".rdata" section,
+	// so it is good enough to test issue #16103.
+	const filename = "ws2_32.dll"
+	path, err := exec.LookPath(filename)
+	if err != nil {
+		t.Fatalf("unable to locate required file %q in search path: %s", filename, err)
+	}
+
+	f, err := Open(path)
+	if err != nil {
+		t.Error(err)
+	}
+	defer f.Close()
+
+	// now we can extract its imports
+	symbols, err := f.ImportedSymbols()
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(symbols) == 0 {
+		t.Fatalf("unable to locate any imported symbols within file %q.", path)
+	}
+}
+
+func TestInvalidFormat(t *testing.T) {
+	crashers := [][]byte{
+		// https://golang.org/issue/30250
+		[]byte("\x00\x00\x00\x0000000\x00\x00\x00\x00\x00\x00\x000000" +
+			"00000000000000000000" +
+			"000000000\x00\x00\x0000000000" +
+			"00000000000000000000" +
+			"0000000000000000"),
+		// https://golang.org/issue/30253
+		[]byte("L\x01\b\x00regi\x00\x00\x00\x00\x00\x00\x00\x00\xe0\x00\x0f\x03" +
+			"\v\x01\x02\x18\x00\x0e\x00\x00\x00\x1e\x00\x00\x00\x02\x00\x00\x80\x12\x00\x00" +
+			"\x00\x10\x00\x00\x00 \x00\x00\x00\x00@\x00\x00\x10\x00\x00\x00\x02\x00\x00" +
+			"\x04\x00\x00\x00\x01\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x90\x00\x00" +
+			"\x00\x04\x00\x00\x06S\x00\x00\x03\x00\x00\x00\x00\x00 \x00\x00\x10\x00\x00" +
+			"\x00\x00\x10\x00\x00\x10\x00\x00\x00\x00\x00\x00\x10\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00`\x00\x00x\x03\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x04\x80\x00\x00\x18\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xb8`\x00\x00|\x00\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"\x00\x00\x00\x00.text\x00\x00\x00d\f\x00\x00\x00\x10\x00\x00" +
+			"\x00\x0e\x00\x00\x00\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"`\x00P`.data\x00\x00\x00\x10\x00\x00\x00\x00 \x00\x00" +
+			"\x00\x02\x00\x00\x00\x12\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"@\x000\xc0.rdata\x00\x004\x01\x00\x00\x000\x00\x00" +
+			"\x00\x02\x00\x00\x00\x14\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"@\x000@.eh_fram\xa0\x03\x00\x00\x00@\x00\x00" +
+			"\x00\x04\x00\x00\x00\x16\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"@\x000@.bss\x00\x00\x00\x00`\x00\x00\x00\x00P\x00\x00" +
+			"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00" +
+			"\x80\x000\xc0.idata\x00\x00x\x03\x00\x00\x00`\x00\x00" +
+			"\x04\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00@\x00" +
+			"0\xc0.CRT\x00\x00\x00\x00\x18\x00\x00\x00\x00p\x00\x00\x00\x02" +
+			"\x00\x00\x00\x1e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00@\x00" +
+			"0\xc0.tls\x00\x00\x00\x00 \x00\x00\x00\x00\x80\x00\x00\x00\x02" +
+			"\x00\x00\x00 \x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x001\xc9" +
+			"H\x895\x1d"),
+	}
+
+	for _, data := range crashers {
+		f, err := NewFile(bytes.NewReader(data))
+		if err != nil {
+			t.Error(err)
+		}
+		f.ImportedSymbols()
 	}
 }

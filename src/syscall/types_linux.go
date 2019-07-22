@@ -53,7 +53,6 @@ package syscall
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
-#include <ustat.h>
 #include <utime.h>
 
 enum {
@@ -112,7 +111,7 @@ typedef struct {} ptracePer;
 // The real epoll_event is a union, and godefs doesn't handle it well.
 struct my_epoll_event {
 	uint32_t events;
-#ifdef __ARM_EABI__
+#if defined(__ARM_EABI__) || (defined(__mips__) && _MIPS_SIM == _ABIO32)
 	// padding is not specified in linux/eventpoll.h but added to conform to the
 	// alignment requirements of EABI
 	int32_t padFd;
@@ -122,6 +121,15 @@ struct my_epoll_event {
 #endif
 	int32_t fd;
 	int32_t pad;
+};
+
+// ustat is deprecated and glibc 2.28 removed ustat.h. Provide the type here for
+// backwards compatibility. Copied from /usr/include/bits/ustat.h
+struct ustat {
+	__daddr_t f_tfree;
+	__ino_t f_tinode;
+	char f_fname[6];
+	char f_fpack[6];
 };
 
 */
@@ -405,6 +413,7 @@ const (
 	_AT_FDCWD            = C.AT_FDCWD
 	_AT_REMOVEDIR        = C.AT_REMOVEDIR
 	_AT_SYMLINK_NOFOLLOW = C.AT_SYMLINK_NOFOLLOW
+	_AT_EACCESS          = C.AT_EACCESS
 )
 
 // Terminal handling

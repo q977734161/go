@@ -4,6 +4,30 @@
 
 #include "textflag.h"
 
+// func Store(ptr *uint32, val uint32)
+TEXT ·Store(SB), NOSPLIT, $0
+	MOVD	ptr+0(FP), R2
+	MOVWZ	val+8(FP), R3
+	MOVW	R3, 0(R2)
+	SYNC
+	RET
+
+// func Store64(ptr *uint64, val uint64)
+TEXT ·Store64(SB), NOSPLIT, $0
+	MOVD	ptr+0(FP), R2
+	MOVD	val+8(FP), R3
+	MOVD	R3, 0(R2)
+	SYNC
+	RET
+
+// func StorepNoWB(ptr unsafe.Pointer, val unsafe.Pointer)
+TEXT ·StorepNoWB(SB), NOSPLIT, $0
+	MOVD	ptr+0(FP), R2
+	MOVD	val+8(FP), R3
+	MOVD	R3, 0(R2)
+	SYNC
+	RET
+
 // func Cas(ptr *uint32, old, new uint32) bool
 // Atomically:
 //	if *ptr == old {
@@ -48,6 +72,10 @@ cas64_fail:
 TEXT ·Casuintptr(SB), NOSPLIT, $0-25
 	BR	·Cas64(SB)
 
+// func CasRel(ptr *uint32, old, new uint32) bool
+TEXT ·CasRel(SB), NOSPLIT, $0-17
+	BR	·Cas(SB)
+
 // func Loaduintptr(ptr *uintptr) uintptr
 TEXT ·Loaduintptr(SB), NOSPLIT, $0-16
 	BR	·Load64(SB)
@@ -69,7 +97,7 @@ TEXT ·Xadduintptr(SB), NOSPLIT, $0-24
 	BR	·Xadd64(SB)
 
 // func Xaddint64(ptr *int64, delta int64) int64
-TEXT ·Xaddint64(SB), NOSPLIT, $0-16
+TEXT ·Xaddint64(SB), NOSPLIT, $0-24
 	BR	·Xadd64(SB)
 
 // func Casp1(ptr *unsafe.Pointer, old, new unsafe.Pointer) bool
@@ -141,7 +169,8 @@ TEXT ·Or8(SB), NOSPLIT, $0-9
 	MOVD    ptr+0(FP), R3
 	MOVBZ   val+8(FP), R4
 	// Calculate shift.
-	AND	$3, R3, R5
+	MOVD	R3, R5
+	AND	$3, R5
 	XOR	$3, R5 // big endian - flip direction
 	SLD	$3, R5 // MUL $8, R5
 	SLD	R5, R4
@@ -159,7 +188,8 @@ TEXT ·And8(SB), NOSPLIT, $0-9
 	MOVD    ptr+0(FP), R3
 	MOVBZ   val+8(FP), R4
 	// Calculate shift.
-	AND	$3, R3, R5
+	MOVD	R3, R5
+	AND	$3, R5
 	XOR	$3, R5 // big endian - flip direction
 	SLD	$3, R5 // MUL $8, R5
 	OR	$-256, R4 // create 0xffffffffffffffxx
